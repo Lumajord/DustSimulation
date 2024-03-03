@@ -1,0 +1,352 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <cstring>
+#include <vector>
+
+#include "SimulationCuda.h"
+#include "SimulationLib.h"
+
+
+#include <sstream>
+#include <string>
+
+extern double F_c;
+extern double ENERGY_UNIT;
+
+extern double rolling_modifier;
+extern double sliding_modifier;
+extern double twisting_modifier;
+
+extern double particle_radius;
+extern double density;
+extern double surface_energy;
+extern double nu;
+extern double young_mod;
+extern double crit_rolling_displacement;
+extern double yield_strength;
+extern double T_vis;
+extern double rolling_modifier;
+extern double sliding_modifier;
+extern double twisting_modifier;
+
+extern double gravity_modifier;
+
+bool doesFileExist(const char *filename) 
+{
+  struct stat stFileInfo;
+  int intStat;
+
+  // attempt to get the file attributes
+  intStat = stat(filename, &stFileInfo);
+  
+  if(intStat == 0)
+	  return true;
+  else 
+	  return false;
+}
+
+void logPressure(SimulationCuda* sim, const char* log_filename, double force_top, double force_bottom, int log_interval)
+{
+	// determine pressure on top&bottom wall
+
+    force_top /= (double)log_interval;
+    force_bottom /= (double)log_interval;
+
+	double pressure_top = 0.1 * force_top/sim->box->base; // /10 to convert from CGS to SI
+	double pressure_bottom = 0.1 * force_bottom/sim->box->base; // /10 to convert from CGS to SI
+
+	// write to log file
+	FILE* log_file = fopen(log_filename, "a");
+
+    //printf("%e  %e\n", sim->getGPUFillingFactor(), pressure_top);
+
+	if(log_file)
+	{	
+        fprintf(log_file, "%.8e %.8e %.8e %.8e\n", sim->current_time, sim->getGPUFillingFactor(), pressure_top, pressure_bottom);
+		fclose(log_file);
+	}
+}
+
+void logKineticEnergy(SimulationCuda* sim, const char* log_filename, double force_top, double force_bottom, int log_interval)
+{
+	// determine pressure on top&bottom wall
+
+    force_top /= (double)log_interval;
+    force_bottom /= (double)log_interval;
+
+	double pressure_top = 0.1 * force_top/sim->box->base; // /10 to convert from CGS to SI
+	double pressure_bottom = 0.1 * force_bottom/sim->box->base; // /10 to convert from CGS to SI
+
+	// write to log file
+	FILE* log_file = fopen(log_filename, "a");
+
+	if(log_file)
+	{
+        fprintf(log_file, "%.8e %.8e %.8e %.8e\n", sim->current_time, pressure_top, pressure_bottom, SimLib::getKineticEnergy(*sim) * ENERGY_UNIT);
+		fclose(log_file);
+	}
+}
+
+int main(int argc, char **argv)
+{
+	// for main simulation
+	double timestep;
+	double wall_speed;
+	double stop_filling_factor;
+
+	double wall_compression_modifier = 1.0; 
+	double wall_rolling_modifier = 1.0;
+	double wall_sliding_modifier = 1.0;
+
+	int log_interval;
+	int sample_filename_index;
+	int log_filename_index;
+	int material_filename_index;
+    int use_gpu = 1;
+    int gpu_id = -1;
+
+
+	if(argc == 6) // continue simulation
+	{
+		timestep = atof(argv[1]);
+		sample_filename_index = 2;
+		material_filename_index = 3;
+		log_filename_index = 4;
+		log_interval = atoi(argv[5]);
+	}
+    else if(argc == 8 || argc == 11 || argc == 12 || argc == 13)	// main mode -> measure pressure while wall is moving downwards
+	{
+		timestep = atof(argv[1]);
+		wall_speed = atof(argv[2]);
+		stop_filling_factor = atof(argv[3]);
+		sample_filename_index = 4;
+		material_filename_index = 5;
+		log_filename_index = 6;
+		log_interval = atoi(argv[7]);
+	}
+	else
+	{
+		printf("Incorrect arguments! Use:\n -timestep -wall_speed -stop_filling_factor -sample_filename -material_filename -log_filename -log_interval\n");
+		return EXIT_SUCCESS;
+	}
+    if(argc == 11)
+    {
+        wall_compression_modifier = atof(argv[8]);
+        wall_rolling_modifier = atof(argv[9]);
+        wall_sliding_modifier = atof(argv[10]);
+    }
+    if(argc == 12)
+	{
+		wall_compression_modifier = atof(argv[8]);
+		wall_rolling_modifier = atof(argv[9]);
+		wall_sliding_modifier = atof(argv[10]);
+        use_gpu = atof(argv[11]);
+	}
+    if(argc == 13)
+    {
+        wall_compression_modifier = atof(argv[8]);
+        wall_rolling_modifier = atof(argv[9]);
+        wall_sliding_modifier = atof(argv[10]);
+        use_gpu = atof(argv[11]);
+        gpu_id = atof(argv[12]);
+    }
+
+
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	// prepare simulation
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    printf("Performing aggregate compression on GPU using particle simulation core v%s\n", CORE_VERSION);
+
+    SimulationCuda sim;
+	ErrorCode error_code = sim.loadMaterial(argv[material_filename_index]);
+
+	if(error_code != EC_OK)
+	{
+		char message[200];
+		sim.getErrorMessage(error_code, message);
+		printf("ERROR:\nWhile trying to load material from %s, the following error occurred:\n%s\n", argv[material_filename_index], message);
+		return EXIT_SUCCESS;
+	}
+
+
+
+	double sim_time; 
+
+
+	// setup sim
+	if(argc == 6) // continue simulation
+	{
+		error_code = sim.loadFromFile(argv[sample_filename_index]);
+		
+		sim_time = sim.box->height / wall_speed;
+		stop_filling_factor = sim.sim_info.info_storage[0];
+		wall_speed = norm(sim.walls[sim.box->top_wall_id].velocity);
+	}
+	else
+	{
+		error_code = SimLib::initCompressionBox(&sim, argv[sample_filename_index], true, false, wall_speed, stop_filling_factor, wall_compression_modifier, wall_rolling_modifier, wall_sliding_modifier);
+		sim_time = sim.box->height / wall_speed;
+	}
+
+	if(error_code != EC_OK)
+	{
+		char message[200];
+		sim.getErrorMessage(error_code, message);
+		printf("ERROR:\nFailed to setup simulation - %s\n", message);
+		return EXIT_SUCCESS;
+	}
+
+
+    /////////////////////////////////////////////////////////////////////////////////////////
+    // setup cuda
+    /////////////////////////////////////////////////////////////////////////////////////////
+
+    if(use_gpu == 1)
+    {
+        printf("Setting up CUDA...\n");
+        error_code = sim.initCuda(gpu_id);
+    }
+    else
+    {
+        printf("Setting up CPU...\n");
+    }
+
+    if(error_code != EC_OK)
+    {
+        char message[200];
+        sim.getErrorMessage(error_code, message);
+        printf("ERROR:\nWhile setting up CUDA the following error occurred:\n%s\n", message);
+        return EXIT_SUCCESS;
+    }
+
+
+
+
+
+
+
+    if(use_gpu == 1)
+        error_code = sim.toggleGPUMode(true);
+    else
+        error_code = sim.toggleGPUMode(false);
+
+
+
+
+
+    if(error_code != EC_OK)
+    {
+        char message[200];
+        sim.getErrorMessage(error_code, message);
+        printf("ERROR:\nFailed to enable GPU mode!\n%s\n", message);
+        return EXIT_SUCCESS;
+    }
+
+
+
+	// start sim
+	error_code = sim.startSimulation(sim_time, timestep);
+
+	if(error_code != EC_OK)
+	{
+		char message[200];
+		sim.getErrorMessage(error_code, message);
+		printf("ERROR:\nFailed to start simulation - %s\n", message);
+		return EXIT_SUCCESS;
+	}
+
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	// prepare log file
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+	FILE *log_file;
+	log_file = fopen(argv[log_filename_index], "w+");
+	fprintf(log_file, "# number of particles: %i\n", sim.number_of_particles);
+	fprintf(log_file, "# box base size (in m^2): %g\n", 1e-4 * sim.box->base);
+	fprintf(log_file, "# box height (in m): %g \n", 0.01 * sim.box->height);
+	fprintf(log_file, "# wall speed (in cm/s): %g \n", wall_speed);
+	fprintf(log_file, "# initial/stop filling factor: %g %g\n", sim.getBoxFillingFactor(), stop_filling_factor);
+	fprintf(log_file, "# T_vis: %g\n", T_vis);
+
+
+    if(argc >= 11)
+		fprintf(log_file, "# compression/rolling/sliding modifier: %g / %g / %g\n", wall_compression_modifier, wall_rolling_modifier, wall_sliding_modifier);
+
+	//if(sim.use_gravity)
+	//	fprintf(log_file, "# Gravity enabled! - gravity strength modifier: %g\n", gravity_modifier);
+
+	fprintf(log_file, "#\n# time      filling factor     top pressure (in Pa)     bottom pressuren (in Pa)\n");
+	fclose(log_file);
+
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+	// run simulation
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+	int log_counter = 0;
+    double top_force = 0.0;
+    double bot_force = 0.0;
+
+    int timesnap = 0;
+    int snap_counter = 0;
+
+    while(!sim.stop_simulation)
+    //for(int i = 0; i < 30; ++i)
+    {
+
+      //  printf("%d\n", i);
+		sim.update();
+
+        //if(use_gpu == 1)//if(sim.current_time > 5.575748e-05)
+        if(true)
+        {
+            timesnap++;
+            if(timesnap == 1000-1)
+            {
+                std::stringstream ss;
+                ss << "/scratch/jordan/data4/tmp" << snap_counter << ".dat";
+                if(use_gpu == 1)
+                    sim.copySimDataFromGPU();
+
+                sim.saveToFile((ss.str()).c_str());
+                timesnap = 0;
+                snap_counter++;
+            }
+        }
+
+		++log_counter;
+
+        if(!sim.get_use_gpu())
+        {
+            top_force += sim.walls[sim.box->top_wall_id].total_force[1];
+            bot_force += sim.walls[sim.box->bottom_wall_id].total_force[1];
+
+
+        }
+
+
+		// write data to log file
+		if(log_counter == log_interval-1)
+		{
+			log_counter = 0;
+
+
+            if(sim.get_use_gpu())
+            {
+                top_force += (sim.getGPUTopWallForce());
+                bot_force += (sim.getGPUBotWallForce());
+            }
+
+
+            logPressure(&sim, argv[log_filename_index], top_force, bot_force, log_interval);
+
+            top_force = 0.0;
+            bot_force = 0.0;
+
+		}
+	}
+
+    return EXIT_SUCCESS;
+}
